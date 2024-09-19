@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import random
+from dataclasses import dataclass
+from typing import Optional
 
 # Convolutional codes are often characterized by the base code rate and the
 # depth (or memory) of the encoder [n, k, K]. The base code rate is typically
@@ -16,11 +18,16 @@ C_LEN = (
 )
 
 
+@dataclass
+class TrellisNode:
+    metric: int = 0xFFFF
+    source_state: int = -1
+
+
 def conv_encode_bytes(message: bytes, state=0) -> list[list[bool]]:
     """
     Encode a list of bytes. The state is initialized to zero. Returns a list of codewords.
     """
-    state = 0
     result = []
     for b in message:
         for bit_idx in range(8):
@@ -38,8 +45,8 @@ def conv_encode(input: bool, state=0) -> tuple[int, list[int]]:
 
     # XXX: This can be made faster if we reverse the polynomials
     # and feed the LFSR from the right.
-    out_1 = (state & G1).bit_count() % 2 ^ input
-    out_2 = (state & G2).bit_count() % 2 ^ input
+    out_1 = ((state & G1).bit_count() + input) & 1
+    out_2 = ((state & G2).bit_count() + input) & 1
     state = ((state >> 1) | input << 5) & 63  # 6 bits
 
     return (state, [out_1, out_2])
@@ -64,27 +71,27 @@ def decode(input: list, num_states: int):
     assert len(input[0]) == 2  # Codewords should be 2 bits long
     state = 0
 
-    dp = [[0xFFFF] * num_states]  # [len(input), num_states]
-    dp[0][0] = 0
+    dp = [[TrellisNode()] * num_states]  # [len(input), num_states]
+    dp[0][0] = TrellisNode(0, -1)
 
     for sym in input:
         prev_col = dp[-1]
-        print(prev_col)
-        new_col = [0xFFFF] * num_states
+        new_col = [TrellisNode()] * num_states
 
         sym = bits_to_number(sym)
-        for state, metric in enumerate(prev_col):
+        for state, node in enumerate(prev_col):
             for t in [False, True]:
                 next_state, word = conv_encode(t, state)
-                new_col[next_state] = min(
-                    new_col[next_state],
-                    metric + hamming_distance(sym, bits_to_number(word)),
+                updated_metric = node.metric + hamming_distance(
+                    sym, bits_to_number(word)
                 )
+
+                if updated_metric < new_col[next_state].metric:
+                    new_col[next_state] = TrellisNode(updated_metric, state)
 
         dp.append(new_col)
 
     # Discard the source state
-    dp = dp[1:]
     return dp
 
 
@@ -104,38 +111,62 @@ def test():
     assert hamming_distance(1234, 1234) == 0
 
 
-if __name__ == "__main__":
-    test()
-    random.seed(42)
+# Returns True if the string was decoded succcesfully
+def simulate(input_len: int = 32, num_errors: int = 0, verbose=False) -> bool:
+    printv = print if verbose else lambda _: ()
 
     num_states = 64
-    input = random.randbytes(32)
 
-    # Input bits are read left to right
+    # Generate a random input.
+    input = random.randbytes(input_len)
+
+    # Encode the information bits.
     encoded = conv_encode_bytes(input)
-    print(f"{input.hex()} -> {encoded}")
+    printv(f"{input.hex()} -> {encoded}")
 
-    # Flip one bit
-    encoded[1][0] ^= True
+    # Insert some errors
+    errors = random.sample(range(len(encoded) * 2), num_errors)
+    for error in errors:
+        encoded[error // 2][error & 1] ^= True
 
-    dp = decode(encoded, num_states)  # [len(encoded), num_states]
-
+    # Decode the codewords into information bits.
+    dp = decode(encoded, num_states)
     decoded = []
-    best_metrics = []
-    print_dp(dp)
 
-    for i, dist in enumerate(dp[::-1]):
-        state = [i for i in range(num_states)]
-        tied = zip(state, dist)
-        best = sorted(tied, key=lambda x: x[1])[0]
-        decoded.append(best[0] & 32 != 0)
-        best_metrics.append(best[1])
+    # Backtrack the Trellis.
+    state = dp[-1].index(min(dp[-1], key=lambda x: x.metric))
+    for step in dp[::-1]:
+        # Because we insert the bits to the LFSR from the left,
+        # we can check the MSB to determine the value of the bit
+        # that caused the transition.
+        decoded.append(state & 32 != 0)
 
+        # The next best state is the state that brought us here
+        state = step[state].source_state
+
+    # Because we are backtracking, the order of decoded is inverted.
+    decoded.reverse()
+
+    # Parse the bits as bytes.
     bytes_ = bits_to_bytes(decoded)[::-1]
 
-    print("SRC: " + input.hex())
-    print("DEC: " + bytes_.hex())
-    print(" " + " ".join(["^" if i != j else " " for i, j in zip(bytes_, input)]))
-    print(best_metrics)
+    printv("SRC: " + input.hex())
+    printv("DEC: " + bytes_.hex())
+    printv("      " + " ".join(["^" if i != j else " " for i, j in zip(bytes_, input)]))
+    printv(f"{"Good" if bytes_ == input else "Bad"}")
 
-    print(f"{"Good" if bytes_ == input else "Bad"}")
+    return bytes_ == input
+
+
+if __name__ == "__main__":
+    random.seed(42)
+    test()
+
+    niters = 128
+    string_length = 32
+    print("Input length:", string_length)
+    for num_errors in range(string_length // 2):
+        bad = 0
+        for iters in range(niters):
+            bad += 1 if not simulate(string_length, num_errors) else 0
+        print(f"Errors: {num_errors}, Failures: {bad}/{niters} ({bad / niters:.2%})")
